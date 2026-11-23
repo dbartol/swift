@@ -79,6 +79,7 @@ class RegexLiteralPatternFeature;
 class RegexLiteralPatternFeatureKind;
 enum class ReferenceOwnership : uint8_t;
 class RequirementRepr;
+enum class SuppressionKind: uint8_t;
 class Type;
 class CanType;
 class TypeBase;
@@ -553,6 +554,23 @@ class BridgedFixIt {
 public:
   swift::CharSourceRange replacementRange;
   BridgedStringRef replacementText;
+};
+
+enum ENUM_EXTENSIBILITY_ATTR(closed) BridgedSuppressionKind {
+  BridgedSuppressionKindByDefault,
+  BridgedSuppressionKindDiagnoseAttribute,
+  BridgedSuppressionKindUnsafeExpr,
+  BridgedSuppressionKindUnsafeAttribute,
+  BridgedSuppressionKindSafeAttribute
+};
+
+swift::SuppressionKind unbridged(BridgedSuppressionKind kind);
+BridgedSuppressionKind bridged(swift::SuppressionKind kind);
+
+class BridgedSuppression {
+public:
+  BridgedSuppressionKind kind;
+  swift::CharSourceRange range;
 };
 
 class BridgedDiagnosticCategoryEntry {

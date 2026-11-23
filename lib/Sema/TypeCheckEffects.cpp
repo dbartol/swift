@@ -317,6 +317,36 @@ static bool isNeverThrownError(Type type) {
 
 namespace {
 
+typedef DiagnosticInfo::Suppression Suppression;
+
+class UnsafeSite {
+public:
+  std::optional<Suppression> getSuppression(const SourceManager &SourceMgr) const {
+    if (unsafeLoc) {
+      // An invalid loc will produce an invalid range, but this is what we expect.
+      return Suppression(SuppressionKind::UnsafeExpr, Lexer::getCharSourceRangeForToken(SourceMgr, *unsafeLoc));
+    } else {
+      return std::nullopt;
+    }
+  }
+  
+  void setUnsafeLoc(std::optional<SourceLoc> loc) {
+    unsafeLoc = loc;
+  }
+  
+  void addUse(UnsafeUse &&use) {
+    uses.push_back(std::move(use));
+  }
+  
+  ArrayRef<UnsafeUse> getUses() const {
+    return uses;
+  }
+  
+private:
+  std::optional<SourceLoc> unsafeLoc;
+  std::vector<UnsafeUse> uses;
+};
+
 /// A function reference.
 class AbstractFunction {
 public:
@@ -3059,7 +3089,9 @@ public:
   SourceLoc awaitLoc = SourceLoc();
 
   /// Stores the location of the innermost 'unsafe'
-  SourceLoc unsafeLoc = SourceLoc();
+  /// A `nullopt` means that there is no `unsafe`. A non-null optional
+  /// holding an invalid `SourceLoc` means that there is an
+  std::optional<SourceLoc> unsafeLoc = std::nullopt;
 
   /// Whether this is a function that rethrows or is reasync.
   bool hasPolymorphicEffect(EffectKind kind) const {
@@ -3824,7 +3856,7 @@ class CheckEffectsCoverage : public EffectsHandlingWalker<CheckEffectsCoverage> 
 
   /// Tracks all of the uncovered uses of unsafe constructs based on their
   /// anchor expression, so we can emit diagnostics at the end.
-  llvm::MapVector<Expr *, std::vector<UnsafeUse>> uncoveredUnsafeUses;
+  llvm::MapVector<Expr *, UnsafeSite> unsafeSites;
 
   static bool isEffectAnchor(Expr *e, bool stopAtAutoClosure) {
     if (e->getLoc().isInvalid())
@@ -3895,7 +3927,7 @@ class CheckEffectsCoverage : public EffectsHandlingWalker<CheckEffectsCoverage> 
     ContextFlags OldFlags;
     ConditionalEffectKind OldMaxThrowingKind;
     SourceLoc OldAwaitLoc;
-    SourceLoc OldUnsafeLoc;
+    std::optional<SourceLoc> OldUnsafeLoc;
 
   public:
     ContextScope(CheckEffectsCoverage &self, std::optional<Context> newContext)
@@ -4146,9 +4178,9 @@ public:
       diagnoseUncoveredAsyncSite(anchor);
     }
 
-    for (const auto &uncoveredUnsafe : uncoveredUnsafeUses) {
-      diagnoseUncoveredUnsafeSite(uncoveredUnsafe.first,
-                                  uncoveredUnsafe.second);
+    for (const auto &unsafeSite : unsafeSites) {
+      diagnoseUncoveredUnsafeSite(unsafeSite.first,
+                                  unsafeSite.second);
     }
   }
 
@@ -4566,7 +4598,7 @@ private:
       Flags.set(ContextFlags::HasAnyUnsafeSite);
 
       // If the unsafe use isn't covered, record the uses
-      if (!Flags.has(ContextFlags::IsUnsafeCovered)) {
+      if (!Flags.has(ContextFlags::IsUnsafeCovered) || CurContext.unsafeLoc) {
         Expr *expr = E.dyn_cast<Expr*>();
         Expr *anchor = walkToAnchor(expr, parentMap,
                                     CurContext.getInterpolatedString(),
@@ -4580,14 +4612,17 @@ private:
         if (replacementLoc.isInvalid())
           replacementLoc = E.getStartLoc();
 
-        auto &anchorUncovered = uncoveredUnsafeUses[anchor];
+        auto &anchorSite = unsafeSites[anchor];
+        if (Flags.has(ContextFlags::IsUnsafeCovered)) {
+          anchorSite.setUnsafeLoc(CurContext.unsafeLoc);
+        }
         for (UnsafeUse unsafeUse : classification.getUnsafeUses()) {
           // If we don't have a source location for this use, use the
           // anchor instead.
           if (unsafeUse.getLocation().isInvalid())
             unsafeUse.replaceLocation(replacementLoc);
 
-          anchorUncovered.push_back(unsafeUse);
+          anchorSite.addUse(std::move(unsafeUse));
         }
       }
       break;
@@ -5204,7 +5239,7 @@ private:
   }
 
   void diagnoseUncoveredUnsafeSite(
-      const Expr *anchor, ArrayRef<UnsafeUse> unsafeUses) {
+      const Expr *anchor, const UnsafeSite &unsafeSite) {
     // Compiler-synthesized code cannot be annotated with 'unsafe' by hand, so
     // an always-unsafe use there isn't actionable. Treat it as merely unsafe,
     // which keeps it out of the way unless strict memory safety checking asked
@@ -5212,8 +5247,8 @@ private:
     bool isSynthesized =
         isSynthesizedAnchor(anchor) || isSynthesizedContext();
 
-    SmallVector<UnsafeUse, 4> usesToDiagnose(unsafeUses.begin(),
-                                             unsafeUses.end());
+    SmallVector<UnsafeUse, 4> usesToDiagnose(unsafeSite.getUses().begin(), unsafeSite.getUses().end());
+    
     bool anyAlways =
         !isSynthesized && retainUnsafeUsesToDiagnose(usesToDiagnose);
 
@@ -5221,6 +5256,7 @@ private:
     Ctx.Diags.diagnose(anchor->getStartLoc(),
                        anyAlways ? diag::always_unsafe_without_unsafe
                                  : diag::unsafe_without_unsafe)
+      .suppress(unsafeSite.getSuppression(Ctx.SourceMgr))
       .fixItInsert(loc, insertText)
       // 'unsafe' markers are stripped from inlinable bodies printed into a
       // .swiftinterface, so this cannot be an error there.

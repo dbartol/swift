@@ -35,6 +35,38 @@ BridgedDiagnosticArgument::BridgedDiagnosticArgument(BridgedStringRef s)
 BridgedDiagnosticArgument::BridgedDiagnosticArgument(Identifier identifier)
     : BridgedDiagnosticArgument(DiagnosticArgument(identifier)) {}
 
+SuppressionKind unbridged(BridgedSuppressionKind kind) {
+  switch (kind) {
+  case BridgedSuppressionKindByDefault:
+    return SuppressionKind::ByDefault;
+  case BridgedSuppressionKindDiagnoseAttribute:
+    return SuppressionKind::DiagnoseAttribute;
+  case BridgedSuppressionKindUnsafeExpr:
+    return SuppressionKind::UnsafeExpr;
+  case BridgedSuppressionKindUnsafeAttribute:
+    return SuppressionKind::UnsafeAttribute;
+  case BridgedSuppressionKindSafeAttribute:
+    return SuppressionKind::SafeAttribute;
+  }
+  llvm_unreachable("unhandled enum value");
+}
+
+BridgedSuppressionKind bridged(SuppressionKind kind) {
+  switch (kind) {
+  case SuppressionKind::ByDefault:
+    return BridgedSuppressionKindByDefault;
+  case SuppressionKind::DiagnoseAttribute:
+    return BridgedSuppressionKindDiagnoseAttribute;
+  case SuppressionKind::UnsafeExpr:
+    return BridgedSuppressionKindUnsafeExpr;
+  case SuppressionKind::UnsafeAttribute:
+    return BridgedSuppressionKindUnsafeAttribute;
+  case SuppressionKind::SafeAttribute:
+    return BridgedSuppressionKindSafeAttribute;
+  }
+  llvm_unreachable("unhandled enum value");
+}
+
 static_assert(sizeof(BridgedDiagnosticFixIt) >= sizeof(DiagnosticInfo::FixIt),
               "BridgedDiagnosticFixIt has wrong size");
 

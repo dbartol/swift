@@ -268,6 +268,16 @@ InFlightDiagnostic &InFlightDiagnostic::highlightChars(CharSourceRange Range) {
   return *this;
 }
 
+/// Add a suppression to the currently-active diagnostic.
+/// Passing `std::nullopt` to the `Suppression` parameter avoids adding a suppression.
+/// This allows us to retain the fluent style in cases where the suppression is conditional.
+InFlightDiagnostic &InFlightDiagnostic::suppress(std::optional<Suppression> S) {
+  assert(IsActive && "Cannot modify an inactive diagnostic");
+  if (Engine && S)
+    getDiag().addSuppression(*S);
+  return *this;
+}
+
 /// Add an insertion fix-it to the currently-active diagnostic.  The
 /// text is inserted immediately *after* the token specified.
 ///
@@ -1315,7 +1325,7 @@ void DiagnosticEngine::formatDiagnosticText(
   }
 }
 
-static DiagnosticKind toDiagnosticKind(DiagnosticBehavior behavior) {
+DiagnosticKind FullDiagnosticBehavior::getDiagnosticKind() const {
   switch (behavior) {
   case DiagnosticBehavior::Unspecified:
     llvm_unreachable("unspecified behavior");
@@ -1350,12 +1360,13 @@ DiagnosticBehavior toDiagnosticBehavior(DiagnosticKind kind, bool isFatal) {
   llvm_unreachable("Unhandled DiagnosticKind in switch.");
 }
 
-std::optional<DiagnosticBehavior>
+std::optional<FullDiagnosticBehavior>
 DiagnosticState::determineUserControlledWarningBehavior(
     const Diagnostic &diag, SourceManager &sourceMgr) const {
   // Compute a behavior relying strictly on command-line provided
   // `warningGroupBehaviorMap`.
   std::optional<DiagnosticBehavior> userControlledBehavior;
+  SuppressionVector suppressions;
   if (warningGroupBehaviorMap.contains(diag.getGroupID())) {
     switch (
         warningGroupBehaviorMap.find(diag.getGroupID())->second.getBehavior()) {
@@ -1366,7 +1377,11 @@ DiagnosticState::determineUserControlledWarningBehavior(
       userControlledBehavior = DiagnosticBehavior::Error;
       break;
     case WarningGroupBehavior::Ignored:
-      userControlledBehavior = DiagnosticBehavior::Ignore;
+      // Treat as a suppressed warning. We'll downgrade to `Ignore` later if this warning
+      // is not being audited.
+      userControlledBehavior = DiagnosticBehavior::Warning;
+      // Add a suppression to represent the command-line behavior.
+      suppressions.push_back(DiagnosticInfo::Suppression(SuppressionKind::ByDefault, CharSourceRange()));
       break;
     case WarningGroupBehavior::None:
       userControlledBehavior = std::nullopt;
@@ -1396,12 +1411,17 @@ DiagnosticState::determineUserControlledWarningBehavior(
         switch (behavior) {
         case AsError:
           userControlledBehavior = DiagnosticBehavior::Error;
+          suppressions.clear();
           break;
         case AsWarning:
           userControlledBehavior = DiagnosticBehavior::Warning;
+          suppressions.clear();
           break;
         case Ignored:
-          userControlledBehavior = DiagnosticBehavior::Ignore;
+          // Treat as a suppressed warning. We'll downgrade to `Ignore` later if this warning
+          // is not being audited.
+          userControlledBehavior = DiagnosticBehavior::Warning;
+          suppressions.push_back(DiagnosticInfo::Suppression(SuppressionKind::DiagnoseAttribute, CharSourceRange()));
           break;
         case None:
           break;
@@ -1411,10 +1431,13 @@ DiagnosticState::determineUserControlledWarningBehavior(
   }
 #endif
 
-  return userControlledBehavior;
+  if (userControlledBehavior)
+    return FullDiagnosticBehavior(*userControlledBehavior, suppressions, false);
+  else
+    return std::nullopt;
 }
 
-DiagnosticBehavior
+FullDiagnosticBehavior
 DiagnosticState::determineBehavior(const Diagnostic &diag,
                                    SourceManager &sourceMgr) const {
   // We determine how to handle a diagnostic based on the following rules
@@ -1429,18 +1452,31 @@ DiagnosticState::determineBehavior(const Diagnostic &diag,
   //   1) Map the diagnostic to its "intended" behavior, applying the behavior
   //      limit for this particular emission
   auto diagInfo = storedDiagnosticInfos[(unsigned)diag.getID()];
+  SuppressionVector suppressions(diag.getSuppressions().begin(), diag.getSuppressions().end());
+  
   DiagnosticBehavior lvl =
       std::max(toDiagnosticBehavior(diagInfo.kind, diagInfo.isFatal),
                diag.getBehaviorLimit());
   assert(lvl != DiagnosticBehavior::Unspecified);
 
+  bool suppressThisNote = false;
+  
   //   2) If current state dictates a certain behavior, follow that
 
-  // Notes relating to ignored diagnostics should also be ignored
-  if (previousBehavior == DiagnosticBehavior::Ignore
-      && lvl == DiagnosticBehavior::Note)
-    lvl = DiagnosticBehavior::Ignore;
-
+  // Notes relating to ignored or suppressed diagnostics should also be ignored or suppressed.
+  if (lvl == DiagnosticBehavior::Note) {
+    switch (previousBehavior) {
+      case EmissionBehavior::Emit:
+        break;
+      case EmissionBehavior::Suppress:
+        suppressThisNote = true;
+        break;
+      case EmissionBehavior::Ignore:
+        lvl = DiagnosticBehavior::Ignore;
+        break;
+    }
+  }
+  
   // Suppress diagnostics when in a fatal state, except for follow-on notes
   if (fatalErrorOccurred)
     if (!showDiagnosticsAfterFatalError && lvl != DiagnosticBehavior::Note)
@@ -1454,8 +1490,12 @@ DiagnosticState::determineBehavior(const Diagnostic &diag,
   //      that change
   if (lvl == DiagnosticBehavior::Warning) {
     if (auto userControlBehavior =
-            determineUserControlledWarningBehavior(diag, sourceMgr))
-      lvl = *userControlBehavior;
+        determineUserControlledWarningBehavior(diag, sourceMgr)) {
+      lvl = userControlBehavior->getBehavior();
+      // Append any suppressions due to the command line or `@diagnose` attributes.
+      auto userSuppressions = userControlBehavior->getSuppressions();
+      suppressions.append(userSuppressions.begin(), userSuppressions.end());
+    }
     if (suppressWarnings)
       lvl = DiagnosticBehavior::Ignore;
   }
@@ -1469,23 +1509,49 @@ DiagnosticState::determineBehavior(const Diagnostic &diag,
     if (suppressRemarks)
       lvl = DiagnosticBehavior::Ignore;
   }
-  return lvl;
+
+  if ((lvl == DiagnosticBehavior::Error) && !suppressions.empty()) {
+    // Errors can be suppressed by special suppressions. For example, the error `always_unsafe_without_unsafe`
+    // can be suppressed by the `unsafe` keyword, even though it cannot be suppressed by a `@diagnose`
+    // annotation.
+    // In this case, we downgrade the error to a (suppressed) warning.
+    lvl = DiagnosticBehavior::Warning;
+  }
+
+  if (!suppressions.empty() && ((diag.getGroupID() != DiagGroupID::StrictMemorySafety) && (diag.getGroupID() != DiagGroupID::AlwaysUnsafe))) {
+    // The warning is not audited, so downgrade it to `Ignore`.
+    lvl = DiagnosticBehavior::Ignore;
+  }
+
+  switch (lvl) {
+    case DiagnosticBehavior::Ignore:
+    case DiagnosticBehavior::Remark:
+    case DiagnosticBehavior::Error:
+    case DiagnosticBehavior::Fatal:
+      return FullDiagnosticBehavior(lvl, {}, false);
+    case DiagnosticBehavior::Note:
+      return FullDiagnosticBehavior(lvl, {}, suppressThisNote);
+    case DiagnosticBehavior::Warning:
+      return FullDiagnosticBehavior(lvl, suppressions, false);
+    case DiagnosticBehavior::Unspecified:
+      llvm_unreachable("Invalid DiagnosticBehavior");
+  }
 }
 
-void DiagnosticState::updateFor(DiagnosticBehavior behavior) {
+void DiagnosticState::updateFor(FullDiagnosticBehavior behavior) {
   // Update current state for use during the next diagnostic
-  if (behavior == DiagnosticBehavior::Fatal) {
+  if (behavior.isFatal()) {
     fatalErrorOccurred = true;
-    anyErrorOccurred = true;
-  } else if (behavior == DiagnosticBehavior::Error) {
+  }
+  if (behavior.isAnyError()) {
     anyErrorOccurred = true;
   }
 
   ASSERT((!assertOnError || !anyErrorOccurred) && "We emitted an error?!");
-  ASSERT((!assertOnWarning || (behavior != DiagnosticBehavior::Warning)) &&
+  ASSERT((!assertOnWarning || !behavior.isUnsuppressedWarning()) &&
          "We emitted a warning?!");
 
-  previousBehavior = behavior;
+  previousBehavior = behavior.getEmissionBehavior();
 }
 
 InFlightDiagnostic DiagnosticEngine::beginDiagnostic(const Diagnostic &D) {
@@ -1548,7 +1614,7 @@ DiagnosticEngine::diagnosticInfoForDiagnostic(const Diagnostic &diagnostic,
   auto behavior = state.determineBehavior(diagnostic, SourceMgr);
   state.updateFor(behavior);
 
-  if (behavior != DiagnosticBehavior::Ignore) {
+  if (behavior.getEmissionBehavior() == EmissionBehavior::Emit) {
     auto groupID = diagnostic.getGroupID();
     if (groupID != DiagGroupID::no_group &&
         state.shouldAssertOnGroup(groupID)) {
@@ -1557,7 +1623,7 @@ DiagnosticEngine::diagnosticInfoForDiagnostic(const Diagnostic &diagnostic,
     }
   }
 
-  if (behavior == DiagnosticBehavior::Ignore)
+  if (behavior.getEmissionBehavior() == EmissionBehavior::Ignore)
     return std::nullopt;
 
   // Figure out the source location.
@@ -1615,11 +1681,12 @@ DiagnosticEngine::diagnosticInfoForDiagnostic(const Diagnostic &diagnostic,
   auto formatString =
       getFormatStringForDiagnostic(diagnostic, includeDiagnosticName);
 
-  return DiagnosticInfo(diagnostic.getID(), loc, toDiagnosticKind(behavior),
+  return DiagnosticInfo(diagnostic.getID(), loc, behavior.getDiagnosticKind(),
+                        behavior.isSuppressed(),
                         formatString, diagnostic.getArgs(), CategoryName,
                         getDefaultDiagnosticLoc(),
-                        /*child note info*/ {}, diagnostic.getRanges(), fixIts,
-                        diagnostic.isChildNote());
+                        /*child note info*/ {}, diagnostic.getRanges(), behavior.getSuppressions(),
+                        fixIts, diagnostic.isChildNote());
 }
 
 static DeclName
@@ -1814,7 +1881,7 @@ void DiagnosticEngine::emitDiagnostic(const Diagnostic &diagnostic) {
     }
 
     for (auto &consumer : Consumers) {
-      consumer->handleDiagnostic(SourceMgr, *info);
+      consumer->processDiagnostic(SourceMgr, *info);
     }
   }
 

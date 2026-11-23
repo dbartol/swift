@@ -282,6 +282,46 @@ private func convertCategoryChain(
   }
 }
 
+private extension ExportedSourceFile {
+  private var baseAddress: UnsafeRawPointer { UnsafeRawPointer(self.buffer.baseAddress!) }
+  private var endAddress: UnsafeRawPointer { self.baseAddress + self.buffer.count }
+  
+  func getPosition(_ loc: SourceLoc) -> AbsolutePosition? {
+    getOffset(loc).map(AbsolutePosition.init)
+  }
+  
+  func getOffset(_ loc: SourceLoc) -> Int? {
+    guard let rawPosition = loc.raw,
+          rawPosition >= self.baseAddress,
+          rawPosition <= self.endAddress else {
+      return nil
+    }
+    
+    return rawPosition - self.baseAddress
+  }
+  
+  func getRange(_ range: CharSourceRange) -> Range<AbsolutePosition>? {
+    guard let rawStart = range.start.raw,
+          rawStart >= self.baseAddress,
+          rawStart < self.endAddress,
+          let rawEnd = range.end.raw,
+          rawEnd >= rawStart,
+          rawEnd <= self.endAddress else {
+      return nil
+    }
+    
+    return AbsolutePosition(utf8Offset: rawStart - self.baseAddress)..<AbsolutePosition(utf8Offset: rawEnd - self.baseAddress)
+  }
+  
+  func contains(_ loc: SourceLoc) -> Bool {
+    getOffset(loc) != nil
+  }
+  
+  func contains(_ range: CharSourceRange) -> Bool {
+    getRange(range) != nil
+  }
+}
+
 /// Add a new diagnostic to the queue.
 @_cdecl("swift_ASTGen_addQueuedDiagnostic")
 public func addQueuedDiagnostic(
@@ -295,25 +335,26 @@ public func addQueuedDiagnostic(
   numCategoryChainEntries: Int,
   highlightRangesPtr: UnsafePointer<CharSourceRange>?,
   numHighlightRanges: Int,
+  suppressionsUntyped: BridgedArrayRef,
   fixItsUntyped: BridgedArrayRef
 ) {
   let queuedDiagnostics = queuedDiagnosticsPtr.assumingMemoryBound(
     to: QueuedDiagnostics.self
   )
-
+  
   let diagnosticState = perFrontendDiagnosticStatePtr.assumingMemoryBound(
     to: PerFrontendDiagnosticState.self
   )
-
+  
   let categoryChain = convertCategoryChain(categoryChainPtr, count: numCategoryChainEntries)
   let category: DiagnosticCategory? = categoryChain.first
-
+  
   // Register all groups for footnote generation.
   for category in categoryChain {
     diagnosticState.pointee.referencedCategories.insert(category)
   }
-
-  guard let rawPosition = loc.raw else {
+  
+  if loc.raw == nil {
     // A diagnostic raised without a source location has nothing to render it
     // against, so it is added to `unlocated`.
     queuedDiagnostics.pointee.unlocated.append(
@@ -327,26 +368,17 @@ public func addQueuedDiagnostic(
     )
     return
   }
-
-  // Find the source file that contains this location.
-  let sourceFileIndex = queuedDiagnostics.pointee.sourceFiles.firstIndex { sf in
-    guard let baseAddress = sf.buffer.baseAddress else {
-      return false
-    }
-
-    return rawPosition >= baseAddress && rawPosition <= baseAddress + sf.buffer.count
-  }
-  guard let sourceFileIndex = sourceFileIndex else {
+  
+  let sourceFile = queuedDiagnostics.pointee.sourceFiles.first { $0.contains(loc) }
+  guard let sourceFile else {
     // FIXME: Hard to report an error here...
     return
   }
-  let sourceFile = queuedDiagnostics.pointee.sourceFiles[sourceFileIndex]
-
-  let sourceFileBaseAddress = UnsafeRawPointer(sourceFile.buffer.baseAddress!)
-  let sourceFileEndAddress = sourceFileBaseAddress + sourceFile.buffer.count
-  let offset = rawPosition - sourceFileBaseAddress
-  let position = AbsolutePosition(utf8Offset: offset)
-
+  
+  guard let position = sourceFile.getPosition(loc) else {
+    return
+  }
+  
   // Find the token at that offset.
   let node: Syntax
   if let token = sourceFile.syntax.token(at: position) {
@@ -375,31 +407,23 @@ public func addQueuedDiagnostic(
     let range = highlightRanges[index]
 
     // Make sure both the start and the end land within this source file.
-    guard let start = range.start.raw, let end = range.end.raw else {
-      continue
-    }
-
-    guard start >= sourceFileBaseAddress && start < sourceFileEndAddress,
-      end >= sourceFileBaseAddress && end <= sourceFileEndAddress
-    else {
+    guard let positionRange = sourceFile.getRange(range) else {
       continue
     }
 
     // Find start tokens in the source file.
-    let startPos = AbsolutePosition(utf8Offset: start - sourceFileBaseAddress)
-    guard let startToken = sourceFile.syntax.token(at: startPos) else {
+    guard let startToken = sourceFile.syntax.token(at: positionRange.lowerBound) else {
       continue
     }
 
     // Walk up from the start token until we find a syntax node that matches
     // the highlight range.
-    let endPos = AbsolutePosition(utf8Offset: end - sourceFileBaseAddress)
     var highlightSyntax = Syntax(startToken)
     while true {
       // If this syntax matches our starting/ending positions, add the
       // highlight and we're done.
-      if highlightSyntax.positionAfterSkippingLeadingTrivia == startPos
-        && highlightSyntax.endPositionBeforeTrailingTrivia == endPos
+      if highlightSyntax.positionAfterSkippingLeadingTrivia == positionRange.lowerBound
+          && highlightSyntax.endPositionBeforeTrailingTrivia == positionRange.upperBound
       {
         highlights.append(highlightSyntax)
         break
@@ -414,16 +438,29 @@ public func addQueuedDiagnostic(
     }
   }
 
+  let suppressions = suppressionsUntyped.withElements(ofType: BridgedSuppression.self) { suppressions in
+    suppressions.map { suppression in
+      let range = sourceFile.getRange(suppression.range)
+      let kind: Suppression.Kind = switch suppression.kind {
+      case .byDefault: .byDefault
+      case .unsafeExpr: .unsafeExpr
+      case .unsafeAttribute: .unsafeAttribute
+      case .safeAttribute: .safeAttribute
+      case .diagnoseAttribute: .diagnoseAttribute
+      }
+      return Suppression(kind: kind, range: range)
+    }
+  }
+  
   // Map the Fix-Its
   let fixItChanges: [FixIt.Change] = fixItsUntyped.withElements(ofType: BridgedFixIt.self) { fixIts in
     fixIts.compactMap { fixIt in
-      guard let startPos = sourceFile.position(of: fixIt.replacementRange.start),
-            let endPos = sourceFile.position(of: fixIt.replacementRange.end) else {
+      guard let replacementRange = sourceFile.getRange(fixIt.replacementRange) else {
         return nil
       }
 
       return FixIt.Change.replaceText(
-        range: startPos..<endPos,
+        range: replacementRange,
         with: String(bridged: fixIt.replacementText),
         in: sourceFile.syntax
       )
@@ -450,6 +487,7 @@ public func addQueuedDiagnostic(
       categoryChain: categoryChain
     ),
     highlights: highlights,
+    suppressions: suppressions,
     fixIts: fixIts
   )
 

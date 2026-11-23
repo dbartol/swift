@@ -45,6 +45,11 @@ void DiagnosticBridge::addQueueDiagnostic(const DiagnosticInfo &info,
          BridgedStringRef(StringRef(entry.DocumentationURL))});
   }
 
+  SmallVector<BridgedSuppression, 2> suppressions;
+  for (const auto &suppression : info.Suppressions) {
+    suppressions.push_back(BridgedSuppression{ bridged(suppression.kind), suppression.range });
+  }
+  
   SmallVector<BridgedFixIt, 2> fixIts;
   for (const auto &fixIt : info.FixIts) {
     fixIts.push_back(BridgedFixIt{ fixIt.getRange(), fixIt.getText() });
@@ -59,6 +64,7 @@ void DiagnosticBridge::addQueueDiagnostic(const DiagnosticInfo &info,
       diagnosticID,
       bridgedDiagGroupChain.data(), bridgedDiagGroupChain.size(),
       info.Ranges.data(), info.Ranges.size(),
+      llvm::ArrayRef<BridgedSuppression>(suppressions),
       llvm::ArrayRef<BridgedFixIt>(fixIts));
 
   // TODO: A better way to do this would be to pass the notes as an

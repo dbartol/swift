@@ -37,6 +37,14 @@ struct DiagnosticCategoryInfo {
   std::string DocumentationURL;
 };
 
+enum class SuppressionKind: uint8_t {
+  ByDefault = 0,
+  DiagnoseAttribute,
+  UnsafeExpr,
+  UnsafeAttribute,
+  SafeAttribute,
+};
+  
 /// Information about a diagnostic passed to DiagnosticConsumers.
 struct DiagnosticInfo {
   DiagID ID = DiagID(0);
@@ -60,6 +68,20 @@ struct DiagnosticInfo {
   /// Index 0 = this diagnostic's category, index 1+ = parent groups toward root.
   /// Empty if the diagnostic has no category.
   std::vector<DiagnosticCategoryInfo> CategoryChain;
+
+  /// Represents a warning suppression.
+  /// A list of suppressions can be attached to a `Warning` diagnostic to describe
+  /// why that diagnostic was ignored. By default, suppressed diagnostics are not
+  /// reported to diagnostic consumes, but individual diagnostic consumers can opt
+  /// in to consuming suppressed warnings.
+  struct Suppression {
+    SuppressionKind kind;
+    CharSourceRange range;
+    
+    Suppression(SuppressionKind kind, CharSourceRange range) : kind(kind), range(range) {}
+  };
+
+  typedef SmallVector<Suppression, 2> SuppressionVector;
 
   /// Represents a fix-it, a replacement of one range of text with another.
   class FixIt {
@@ -89,31 +111,46 @@ struct DiagnosticInfo {
   /// Extra source ranges that are attached to the diagnostic.
   ArrayRef<CharSourceRange> Ranges;
 
+  /// Suppressions that are attached to the diagnostic.
+  /// Cannot be an `ArrayRef` because suppressions are combined from the
+  /// original `Diagnostic` and from suppression annotations in the source
+  /// code.
+  SuppressionVector Suppressions;
+
   /// Extra source ranges that are attached to the diagnostic.
   ArrayRef<FixIt> FixIts;
-
+  
   /// This is a note which has a parent error or warning
   bool IsChildNote = false;
 
+  /// This note or warning is suppressed
+  /// A suppressed warning should have at least one element in its ``Suppressions`` array.
+  /// A suppressed note should have an _empty_ ``Suppressions`` array.
+  bool IsSuppressed = false;
+  
   DiagnosticInfo() {}
 
   DiagnosticInfo(DiagID ID, SourceLoc Loc, DiagnosticKind Kind,
-                 StringRef FormatString,
+                 bool IsSuppressed, StringRef FormatString,
                  ArrayRef<DiagnosticArgument> FormatArgs, StringRef Category,
                  SourceLoc BufferIndirectlyCausingDiagnostic,
                  ArrayRef<DiagnosticInfo *> ChildDiagnosticInfo,
-                 ArrayRef<CharSourceRange> Ranges, ArrayRef<FixIt> FixIts,
-                 bool IsChildNote)
+                 ArrayRef<CharSourceRange> Ranges, ArrayRef<Suppression> Suppressions,
+                 ArrayRef<FixIt> FixIts, bool IsChildNote)
       : ID(ID), Loc(Loc), Kind(Kind), FormatString(FormatString),
         FormatArgs(FormatArgs),
         BufferIndirectlyCausingDiagnostic(BufferIndirectlyCausingDiagnostic),
         ChildDiagnosticInfo(ChildDiagnosticInfo), Ranges(Ranges),
-        FixIts(FixIts), IsChildNote(IsChildNote) {
+        Suppressions(Suppressions), FixIts(FixIts), IsChildNote(IsChildNote),
+        IsSuppressed(IsSuppressed) {
+    assert(Suppressions.empty() || IsSuppressed);
     if (!Category.empty())
       CategoryChain.push_back({Category, ""});
   }
 };
-  
+
+typedef DiagnosticInfo::SuppressionVector SuppressionVector;
+
 /// Abstract interface for classes that present diagnostics to the user.
 class DiagnosticConsumer {
 protected:
@@ -128,9 +165,11 @@ protected:
     return llvm::SMFixIt(getRawRange(SM, F.getRange()), F.getText());
   }
 
-public:
-  virtual ~DiagnosticConsumer();
-
+  /// Override this to return `true` if this consumer can accept suppressed diagnostics.
+  /// The default implementation returns `false`, so that the consumer will be given only
+  /// diagnostics that are expected to be emitted.
+  virtual bool acceptsSuppressedDiagnostics() const { return false; }
+  
   /// Invoked whenever the frontend emits a diagnostic.
   ///
   /// \param SM The source manager associated with the source locations in
@@ -142,12 +181,21 @@ public:
   virtual void handleDiagnostic(SourceManager &SM,
                                 const DiagnosticInfo &Info) = 0;
 
+public:
+  virtual ~DiagnosticConsumer();
+
   /// \returns true if an error occurred while finishing-up.
   virtual bool finishProcessing() { return false; }
 
   /// Flush any in-flight diagnostics.
   virtual void flush() {}
 
+  void processDiagnostic(SourceManager &SM,
+                         const DiagnosticInfo &Info) {
+    if (!Info.IsSuppressed || acceptsSuppressedDiagnostics())
+      handleDiagnostic(SM, Info);
+  }
+  
   /// In batch mode, any error causes failure for all primary files, but
   /// anyone consulting .dia files will only see an error for a particular
   /// primary in that primary's serialized diagnostics file. For other
@@ -236,7 +284,7 @@ public:
       if (!getConsumer())
         return;
       hasAnErrorBeenConsumed |= Info.Kind == DiagnosticKind::Error;
-      getConsumer()->handleDiagnostic(SM, Info);
+      getConsumer()->processDiagnostic(SM, Info);
     }
 
     void informDriverOfIncompleteBatchModeCompilation() {

@@ -286,11 +286,11 @@ void DiagnosticHelper::Implementation::diagnoseFatalError(const char *reason,
   SourceManager dummyMgr;
 
   DiagnosticInfo errorInfo(
-      DiagID(0), SourceLoc(), DiagnosticKind::Error,
+      DiagID(0), SourceLoc(), DiagnosticKind::Error, false,
       "fatal error encountered during compilation; " SWIFT_BUG_REPORT_MESSAGE,
-      {}, StringRef(), SourceLoc(), {}, {}, {}, false);
-  DiagnosticInfo noteInfo(DiagID(0), SourceLoc(), DiagnosticKind::Note, reason,
-                          {}, StringRef(), SourceLoc(), {}, {}, {}, false);
+      {}, StringRef(), SourceLoc(), {}, {}, {}, {}, false);
+  DiagnosticInfo noteInfo(DiagID(0), SourceLoc(), DiagnosticKind::Note, false, reason,
+                          {}, StringRef(), SourceLoc(), {}, {}, {}, {}, false);
   PDC.handleDiagnostic(dummyMgr, errorInfo);
   PDC.handleDiagnostic(dummyMgr, noteInfo);
   if (shouldCrash)

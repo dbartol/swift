@@ -61,6 +61,11 @@ struct SerializedCharSourceRange {
   unsigned ByteLength;
 };
 
+struct SerializedSuppression {
+  SerializedCharSourceRange Range;
+  uint8_t Kind;
+};
+
 struct SerializedFixIt {
   SerializedCharSourceRange Range;
   std::string Text;
@@ -79,8 +84,10 @@ struct SerializedDiagnosticInfo {
   std::vector<SerializedDiagnosticInfo> ChildDiagnosticInfo;
   std::vector<std::string> EducationalNotePaths;
   std::vector<SerializedCharSourceRange> Ranges;
+  std::vector<SerializedSuppression> Suppressions;
   std::vector<SerializedFixIt> FixIts;
   bool IsChildNote;
+  bool IsSuppressed;
 };
 
 struct SerializedFile {
@@ -160,6 +167,8 @@ private:
   SerializedCharSourceRange convertSourceRange(SourceManager &SM,
                                                const CharSourceRange &Range,
                                                bool AddVirtualFile = true);
+  SerializedSuppression convertSuppressionInfo(SourceManager &SM,
+                               const DiagnosticInfo::Suppression &SI);
   SerializedFixIt convertFixIt(SourceManager &SM,
                                const DiagnosticInfo::FixIt &FI);
   SerializedDiagnosticInfo convertDiagnosticInfo(SourceManager &SM,
@@ -177,6 +186,7 @@ private:
   struct DiagnosticStorage {
     SmallVector<DiagnosticInfo, 2> ChildDiag;
     SmallVector<CharSourceRange, 2> Ranges;
+    SuppressionVector Suppressions;
     SmallVector<DiagnosticInfo::FixIt, 2> FixIts;
   };
   llvm::Error deserializeDiagnosticInfo(const SerializedDiagnosticInfo &,
@@ -235,6 +245,14 @@ struct MappingTraits<SerializedCharSourceRange> {
 };
 
 template <>
+struct MappingTraits<SerializedSuppression> {
+  static void mapping(IO &io, SerializedSuppression &Suppression) {
+    io.mapRequired("Kind", Suppression.Kind);
+    io.mapRequired("Range", Suppression.Range);
+  }
+};
+
+template <>
 struct MappingTraits<SerializedFixIt> {
   static void mapping(IO &io, SerializedFixIt &FixIt) {
     io.mapRequired("Range", FixIt.Range);
@@ -256,6 +274,7 @@ struct MappingTraits<SerializedDiagnosticInfo> {
     io.mapOptional("Ranges", Info.Ranges);
     io.mapOptional("FixIts", Info.FixIts);
     io.mapOptional("IsChildNote", Info.IsChildNote, false);
+    io.mapOptional("Suppressions", Info.Suppressions);
   }
 };
 
@@ -303,6 +322,7 @@ struct MappingTraits<DiagnosticSerializer> {
 } // namespace llvm::yaml
 
 LLVM_YAML_IS_SEQUENCE_VECTOR(SerializedCharSourceRange)
+LLVM_YAML_IS_SEQUENCE_VECTOR(SerializedSuppression)
 LLVM_YAML_IS_SEQUENCE_VECTOR(SerializedFixIt)
 LLVM_YAML_IS_SEQUENCE_VECTOR(SerializedDiagnosticInfo)
 LLVM_YAML_IS_SEQUENCE_VECTOR(SerializedFile)
@@ -415,6 +435,12 @@ SerializedCharSourceRange DiagnosticSerializer::convertSourceRange(
           Range.isValid() ? Range.getByteLength() : 0};
 }
 
+SerializedSuppression
+DiagnosticSerializer::convertSuppressionInfo(SourceManager &SM,
+                                   const DiagnosticInfo::Suppression &SI) {
+  return {convertSourceRange(SM, SI.range), (uint8_t)SI.kind};
+}
+
 SerializedFixIt
 DiagnosticSerializer::convertFixIt(SourceManager &SM,
                                    const DiagnosticInfo::FixIt &FI) {
@@ -461,6 +487,15 @@ DiagnosticSerializer::convertDiagnosticInfo(SourceManager &SM,
     return Serialized;
   };
 
+  auto convertSuppressionInfoArray = [&](ArrayRef<DiagnosticInfo::Suppression> Suppressions) {
+    std::vector<SerializedSuppression> Serialized;
+    Serialized.reserve(Suppressions.size());
+    llvm::for_each(Suppressions, [&](const DiagnosticInfo::Suppression &Suppression) {
+      return Serialized.emplace_back(convertSuppressionInfo(SM, Suppression));
+    });
+    return Serialized;
+  };
+
   auto convertFixItArray = [&](ArrayRef<DiagnosticInfo::FixIt> FixIts) {
     std::vector<SerializedFixIt> Serialized;
     Serialized.reserve(FixIts.size());
@@ -482,8 +517,10 @@ DiagnosticSerializer::convertDiagnosticInfo(SourceManager &SM,
           convertDiagnosticInfoArray(Info.ChildDiagnosticInfo),
           educationalNotes,
           convertSourceRangeArray(Info.Ranges),
+          convertSuppressionInfoArray(Info.Suppressions),
           convertFixItArray(Info.FixIts),
-          Info.IsChildNote};
+          Info.IsChildNote,
+          Info.IsSuppressed};
 }
 
 static llvm::Error createDeserializationError(StringRef Msg) {
@@ -633,16 +670,19 @@ llvm::Error DiagnosticSerializer::deserializeDiagnosticInfo(
     Storage.FixIts.emplace_back(*FixIt);
   }
   auto FixIts = ArrayRef(Storage.FixIts).take_back(Info.FixIts.size());
+  auto Suppressions = ArrayRef(Storage.Suppressions).take_back(Info.Suppressions.size());
 
   DiagnosticInfo DeserializedInfo{ID,
                                   *Loc,
                                   Kind,
+                                  Info.IsSuppressed,
                                   Info.FormatString,
                                   {},
                                   Info.Category,
                                   *BICD,
                                   ChildDiagPtrs,
                                   Ranges,
+                                  Suppressions,
                                   FixIts,
                                   Info.IsChildNote};
   if (Info.EducationalNotePaths.size() == 1)
@@ -721,7 +761,7 @@ llvm::Error DiagnosticSerializer::doEmitFromCached(llvm::StringRef Buffer,
     auto E = deserializeDiagnosticInfo(Info, Storage,
                                        [&](const DiagnosticInfo &Info) {
                                          for (auto *Diag : Diags.getConsumers())
-                                           Diag->handleDiagnostic(SrcMgr, Info);
+                                           Diag->processDiagnostic(SrcMgr, Info);
                                          return llvm::Error::success();
                                        });
     if (E)
@@ -779,12 +819,12 @@ public:
     // Bypass the caching.
     if (BypassDiagIDs.count(Info.ID)) {
       for (auto *Diag : OrigConsumers)
-        Diag->handleDiagnostic(Serializer.getSourceMgr(), Info);
+        Diag->processDiagnostic(Serializer.getSourceMgr(), Info);
       return;
     }
     Serializer.handleDiagnostic(SM, Info, [&](const DiagnosticInfo &Info) {
       for (auto *Diag : OrigConsumers)
-        Diag->handleDiagnostic(Serializer.getSourceMgr(), Info);
+        Diag->processDiagnostic(Serializer.getSourceMgr(), Info);
       return llvm::Error::success();
     });
   }

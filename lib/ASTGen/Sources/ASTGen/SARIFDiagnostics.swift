@@ -18,6 +18,7 @@
 import BasicBridging
 import Foundation
 import SARIF
+import SARIFRecords
 @_spi(Compiler) import SwiftDiagnostics
 import SwiftSyntax
 
@@ -37,22 +38,20 @@ extension DiagnosticSeverity {
 }
 
 extension ExportedSourceFile {
-  /// The 1-based UTF-16 code unit column of \c position within its line.
+  /// The 1-based UTF-16 code unit column of \c location within its line.
   ///
   /// 'SourceLocationConverter' reports a column as a UTF-8 byte offset, while
   /// SARIF measures it in the unit named by the run's 'columnKind'. The two
   /// agree only for lines that are entirely ASCII, so the bytes preceding the
   /// position on its line have to be re-counted.
-  fileprivate func utf16Column(
-    of position: AbsolutePosition, utf8Column: Int
-  ) -> Int {
+  fileprivate func utf16Location(for location: SourceLocation) -> Int {
     // 'utf8Column' is 1-based, so the line begins that many bytes back.
-    let lineStart = position.utf8Offset - (utf8Column - 1)
-    guard lineStart >= 0, position.utf8Offset <= buffer.count else {
-      return utf8Column
+    let lineStart = location.offset - (location.column - 1)
+    guard lineStart >= 0, location.offset <= buffer.count else {
+      return location.column
     }
 
-    let linePrefix = buffer[lineStart..<position.utf8Offset]
+    let linePrefix = buffer[lineStart..<location.offset]
     return String(decoding: linePrefix, as: UTF8.self).utf16.count + 1
   }
 }
@@ -145,20 +144,31 @@ private final class SARIFLogBuilder {
   /// The SARIF location for a diagnostic at \c position in the source file at
   /// \c sourceFileIndex.
   func location(
-    at position: AbsolutePosition, inSourceFileAt sourceFileIndex: Int,
+    range: Range<AbsolutePosition>, inSourceFileAt sourceFileIndex: Int,
     in sourceFiles: [ExportedSourceFile], message: Message? = nil
   ) -> Location {
     let sourceFile = sourceFiles[sourceFileIndex]
-    let converted = converter(
-      forSourceFileAt: sourceFileIndex, in: sourceFiles).location(for: position)
-    let column = sourceFile.utf16Column(
-      of: position, utf8Column: converted.column)
+    let converter = converter(
+      forSourceFileAt: sourceFileIndex, in: sourceFiles)
+    
+    let startLocation = converter.location(for: range.lowerBound)
+    let utf16StartColumn = sourceFile.utf16Location(for: startLocation)
+    let endLocation: SourceLocation
+    let utf16EndColumn: Int
+    if range.isEmpty {
+      endLocation = startLocation
+      utf16EndColumn = utf16StartColumn
+    } else {
+      endLocation = converter.location(for: range.upperBound)
+      utf16EndColumn = sourceFile.utf16Location(for: endLocation)
+    }
 
     let artifact = self.artifact(
       forSourceFileAt: sourceFileIndex, in: sourceFiles)
 
     let region = Region(
-      text: TextRegion(line: Int32(converted.line), column: Int32(column)))
+      text: TextRegion(startLine: Int32(startLocation.line), startColumn: Int32(utf16StartColumn),
+                       endLine: Int32(endLocation.line), endColumn: Int32(utf16EndColumn)))
 
     return Location(
       at: PhysicalLocation(
@@ -180,6 +190,8 @@ private final class SARIFLogBuilder {
     return result
   }
 }
+
+private let SwiftSuppressionKindProperty: HierarchicalString = "swift/suppressionKind"
 
 /// Render the queued diagnostics as a SARIF log.
 ///
@@ -209,11 +221,28 @@ public func renderQueuedDiagnosticsAsSARIF(
 
     for (sourceFileIndex, sourceFileID) in queued.grouped.sourceFileIDs.enumerated() {
       for diagnostic in queued.grouped.diagnostics(in: sourceFileID) {
-        builder.addResult(for: diagnostic.diagMessage).locations = [
+        let result = builder.addResult(for: diagnostic.diagMessage)
+        result.locations = [
           builder.location(
-            at: diagnostic.position, inSourceFileAt: sourceFileIndex,
+            range: diagnostic.position..<diagnostic.position, inSourceFileAt: sourceFileIndex,
             in: queued.sourceFiles)
         ]
+        result.suppressions.append(contentsOf: diagnostic.suppressions.map { suppression in
+          let properties: PropertyBag = [SwiftSuppressionKindProperty: .init(string: suppression.kind.rawValue)]
+
+          let kind: SuppressionKind = switch suppression.kind {
+          case .byDefault: .external
+          case .diagnoseAttribute, .unsafeExpr, .unsafeAttribute, .safeAttribute: .inSource
+          }
+          
+          let location = suppression.range.map { range in
+            // REVIEW: This assumes that the suppression is in the same source file as the diagnostic.
+            // This is probably true at the moment.
+            builder.location(range: range, inSourceFileAt: sourceFileIndex, in: queued.sourceFiles)
+          }
+          
+          return .init(kind: kind, location: location, properties: properties)
+        })
       }
     }
 

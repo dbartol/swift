@@ -269,6 +269,6 @@ void ForwardingDiagnosticConsumer::handleDiagnostic(
     llvm::dbgs() << "\n";
   });
   for (auto *C : TargetEngine.getConsumers()) {
-    C->handleDiagnostic(SM, Info);
+    C->processDiagnostic(SM, Info);
   }
 }

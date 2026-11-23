@@ -35,6 +35,7 @@ void swift_ASTGen_addQueuedDiagnostic(
     ptrdiff_t numCategoryChainEntries,
     const swift::CharSourceRange *_Nullable highlightRanges,
     ptrdiff_t numHighlightRanges,
+    BridgedArrayRef /*BridgedSuppression*/ suppressions,
     BridgedArrayRef /*BridgedFixIt*/ fixIts);
 bool swift_ASTGen_renderQueuedDiagnosticsAsSARIF(
     void *_Nullable queued,

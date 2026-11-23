@@ -354,6 +354,12 @@ public:
     return CharSourceRange(SM, SR.Start, getLocForEndOfToken(SM, SR.End));
   }
 
+  static CharSourceRange
+  getCharSourceRangeForToken(const SourceManager &SM,
+                             SourceLoc Loc) {
+    return getCharSourceRangeFromSourceRange(SM, SourceRange(Loc, Loc));
+  }
+  
   /// Return the start location of the token that the offset in the given buffer
   /// points to.
   ///

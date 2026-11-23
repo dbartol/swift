@@ -82,7 +82,7 @@ struct ErrorDowngradeConsumerRAII: DiagnosticConsumer {
       localInfo.Kind = DiagnosticKind::Warning;
       SeenError = true;
       for (auto *consumer: allConsumers) {
-        consumer->handleDiagnostic(SM, localInfo);
+        consumer->processDiagnostic(SM, localInfo);
       }
     }
   }

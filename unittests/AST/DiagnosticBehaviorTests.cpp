@@ -12,6 +12,7 @@
 
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/DiagnosticsFrontend.h"
+#include "swift/AST/DiagnosticsSema.h"
 #include "swift/Basic/SourceManager.h"
 #include "gtest/gtest.h"
 
@@ -91,6 +92,23 @@ TEST(DiagnosticBehavior, WarnUntilSwiftLangMode) {
         diags.setLanguageVersion(version::Version({4}));
         diags.diagnose(SourceLoc(), diag::error_immediate_mode_missing_stdlib)
             .warnUntilLanguageMode(LanguageMode::future);
+      },
+      [](DiagnosticEngine &diags, const DiagnosticInfo &info) {
+        EXPECT_EQ(info.Kind, DiagnosticKind::Warning);
+        EXPECT_EQ(info.FormatString,
+                  diags.getFormatStringForDiagnostic(
+                      diag::error_in_a_future_swift_lang_mode.ID));
+
+        auto wrappedDiagInfo = info.FormatArgs.front().getAsDiagnostic();
+        EXPECT_EQ(wrappedDiagInfo->FormatString,
+                  diags.getFormatStringForDiagnostic(
+                      diag::error_immediate_mode_missing_stdlib.ID));
+      },
+      /*expectedNumCallbackCalls=*/1);
+
+  testCase(
+      [](DiagnosticEngine &diags) {
+        diags.diagnose(SourceLoc(), diag::unsafe_without_unsafe);
       },
       [](DiagnosticEngine &diags, const DiagnosticInfo &info) {
         EXPECT_EQ(info.Kind, DiagnosticKind::Warning);

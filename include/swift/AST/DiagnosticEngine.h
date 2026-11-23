@@ -101,6 +101,16 @@ namespace swift {
     enum class RequirementKind : uint8_t;
   }
 
+  /// How a given diagnostic should be emitted to the consumers.
+  enum class EmissionBehavior: uint8_t {
+    /// The diagnostic should be emitted to all consumers (not ignored, not suppressed).
+    Emit = 0,
+    /// The diagnostic should be emitted only to consumers that can handle suppressed diagnostics.
+    Suppress,
+    /// The diagnostic should not be emitted to any consumers.
+    Ignore
+  };
+
   /// Describes the current behavior to take with a diagnostic.
   /// Ordered from most severe to least.
   struct DiagnosticBehavior {
@@ -125,6 +135,61 @@ namespace swift {
       auto value = std::max(std::underlying_type<Kind>::type(*this),
                             std::underlying_type<Kind>::type(other));
       return Kind(value);
+    }
+  };
+
+  class FullDiagnosticBehavior {
+    DiagnosticBehavior behavior;
+    SuppressionVector suppressions;
+    bool suppressed;
+    
+  public:
+    FullDiagnosticBehavior(DiagnosticBehavior behavior, const SuppressionVector &suppressions, bool suppressed) : behavior(behavior) {
+      if (behavior == DiagnosticBehavior::Warning) {
+        this->suppressions.append(suppressions.begin(), suppressions.end());
+      }
+      
+      this->suppressed = isSuppressible(behavior) && (suppressed || !this->suppressions.empty());
+    }
+    
+    bool isFatal() const {
+      return behavior == DiagnosticBehavior::Fatal;
+    }
+    
+    bool isAnyError() const {
+      return (behavior == DiagnosticBehavior::Error) || (behavior == DiagnosticBehavior::Fatal);
+    }
+    
+    bool isUnsuppressedWarning() const {
+      return (behavior == DiagnosticBehavior::Warning) && !suppressed;
+    }
+    
+    bool isSuppressed() const {
+      return suppressed;
+    }
+    
+    DiagnosticBehavior getBehavior() const {
+      return behavior;
+    }
+    
+    ArrayRef<DiagnosticInfo::Suppression> getSuppressions() const {
+      return suppressions;
+    }
+    
+    DiagnosticKind getDiagnosticKind() const;
+    
+    EmissionBehavior getEmissionBehavior() const {
+      if (suppressed)
+        return EmissionBehavior::Suppress;
+      else if (behavior == DiagnosticBehavior::Ignore)
+        return EmissionBehavior::Ignore;
+      else
+        return EmissionBehavior::Emit;
+    }
+    
+  private:
+    static bool isSuppressible(DiagnosticBehavior behavior) {
+      return (behavior == DiagnosticBehavior::Warning) || (behavior == DiagnosticBehavior::Note);
     }
   };
 
@@ -168,6 +233,7 @@ namespace swift {
   class Diagnostic {
   public:
     typedef DiagnosticInfo::FixIt FixIt;
+  typedef DiagnosticInfo::Suppression Suppression;
 
   private:
     DiagID ID;
@@ -175,6 +241,7 @@ namespace swift {
     SmallVector<DiagnosticArgument, 3> Args;
     SmallVector<CharSourceRange, 2> Ranges;
     SmallVector<FixIt, 2> FixIts;
+    SuppressionVector Suppressions;
     std::vector<Diagnostic> ChildNotes;
     SourceLoc Loc;
     bool IsChildNote = false;
@@ -223,6 +290,7 @@ namespace swift {
     ArrayRef<DiagnosticArgument> getArgs() const { return Args; }
     ArrayRef<CharSourceRange> getRanges() const { return Ranges; }
     ArrayRef<FixIt> getFixIts() const { return FixIts; }
+    ArrayRef<Suppression> getSuppressions() const { return Suppressions; }
     ArrayRef<Diagnostic> getChildNotes() const { return ChildNotes; }
     bool isChildNote() const { return IsChildNote; }
     SourceLoc getLoc() const { return Loc; }
@@ -259,6 +327,10 @@ namespace swift {
       FixIts.push_back(std::move(F));
     }
 
+    void addSuppression(const Suppression &S) {
+      Suppressions.push_back(S);
+    }
+    
     void addChildNote(Diagnostic &&D);
     void insertChildNote(unsigned beforeIndex, Diagnostic &&D);
 
@@ -345,6 +417,8 @@ namespace swift {
     Diagnostic &getDiag() const { return getActiveDiag().Diag; }
 
   public:
+    typedef DiagnosticInfo::Suppression Suppression;
+    
     /// Create an active but unattached in-flight diagnostic.
     /// 
     /// The resulting diagnostic can be used as a dummy, accepting the
@@ -518,6 +592,8 @@ namespace swift {
     /// Add a character-based range to the currently-active diagnostic.
     InFlightDiagnostic &highlightChars(CharSourceRange Range);
 
+    InFlightDiagnostic &suppress(std::optional<Suppression> S);
+    
     static const char *fixItStringFor(const FixItID id);
 
     /// Add a token-based replacement fix-it to the currently-active
@@ -674,7 +750,7 @@ namespace swift {
     bool anyErrorOccurred = false;
 
     /// Track the previous emitted Behavior, useful for notes
-    DiagnosticBehavior previousBehavior = DiagnosticBehavior::Unspecified;
+    EmissionBehavior previousBehavior = EmissionBehavior::Emit;
 
     friend class DiagnosticStateRAII;
 
@@ -683,11 +759,11 @@ namespace swift {
 
     /// Figure out the Behavior for the given diagnostic, taking current
     /// state such as fatality into account.
-    DiagnosticBehavior determineBehavior(const Diagnostic &diag,
+    FullDiagnosticBehavior determineBehavior(const Diagnostic &diag,
                                          SourceManager &sourceMgr) const;
 
     /// Updates the diagnostic state for a diagnostic to emit.
-    void updateFor(DiagnosticBehavior behavior);
+    void updateFor(FullDiagnosticBehavior behavior);
 
     bool hadAnyError() const { return anyErrorOccurred; }
     bool hasFatalErrorOccurred() const { return fatalErrorOccurred; }
@@ -787,7 +863,7 @@ namespace swift {
     /// the diagnostic's source location.
     ///
     /// Caller must ensure \p diag's effective behavior is a warning.
-    std::optional<DiagnosticBehavior>
+    std::optional<FullDiagnosticBehavior>
     determineUserControlledWarningBehavior(const Diagnostic &diag,
                                            SourceManager &sourceMgr) const;
   };
@@ -1358,7 +1434,7 @@ namespace swift {
   /// ensure that their changes to diagnostic engine state don't leak out and
   /// affect the caller's diagnostics.
   class DiagnosticStateRAII {
-    llvm::SaveAndRestore<DiagnosticBehavior> previousBehavior;
+    llvm::SaveAndRestore<EmissionBehavior> previousBehavior;
 
   public:
     DiagnosticStateRAII(DiagnosticEngine &diags)
@@ -1435,8 +1511,7 @@ namespace swift {
       for (auto &diagnostic : diagnostics) {
         auto behavior = Engine.state.determineBehavior(diagnostic.Diag,
                                                        Engine.SourceMgr);
-        if (behavior == DiagnosticBehavior::Fatal ||
-            behavior == DiagnosticBehavior::Error)
+        if (behavior.isAnyError())
           return true;
       }
 

@@ -106,6 +106,10 @@ public:
     return false;
   }
 
+  bool acceptsSuppressedDiagnostics() const override {
+    return true;
+  }
+  
   void informDriverOfIncompleteBatchModeCompilation() override {
     CompilationWasComplete = false;
   }
@@ -115,6 +119,11 @@ public:
     // Notes are delivered again as children of the diagnostic they belong to,
     // and are queued along with it, so skip them here.
     if (Info.IsChildNote)
+      return;
+    
+    // Ignore notes for suppressed diagnostics until we can start attaching them
+    // as "related locations" instead of as separate "results".
+    if ((Info.Kind == DiagnosticKind::Note) && Info.IsSuppressed)
       return;
 
     // A diagnostic with no source location, such as a failure to open an input
@@ -151,6 +160,12 @@ public:
 
   void handleDiagnostic(SourceManager &SM,
                         const DiagnosticInfo &Info) override {
+    if (Info.Kind == DiagnosticKind::Note) {
+      // We can't easily handle notes that are not already attached to a parent,
+      // so just drop them.
+      return;
+    }
+    
     llvm::sys::SmartScopedLock<true> Lock(DiagnosticConsumerStateLock);
     SARIFDiagnosticConsumer::handleDiagnostic(SM, Info);
   }

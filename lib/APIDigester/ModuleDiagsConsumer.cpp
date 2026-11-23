@@ -160,7 +160,7 @@ FilteringDiagnosticConsumer::handleDiagnostic(SourceManager &SM,
       HasError = true;
     }
     for (auto &consumer: subConsumers) {
-      consumer->handleDiagnostic(SM, Info);
+      consumer->processDiagnostic(SM, Info);
     }
   }
 }
